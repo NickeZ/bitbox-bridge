@@ -12,6 +12,30 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! This crate provides an async abstraction over hidapi.
+//!
+//! This library will spawn one thread per connected device.
+//!
+//! # Usage
+//!
+//! ```rust,no_run
+//! use hidapi::HidApi;
+//! fn main() {
+//!    let api = HidApi::new().unwrap();
+//!    let device = api.open(...);
+//!
+//!    let device = Device::new(device);
+//!
+//!    rt.block_on(async {
+//!        let cmd = [0u8; 65];
+//!        device.write(&cmd[..]).await;
+//!        let buf = [0u8; 64];
+//!        let len = device.read(&buf).await();
+//!        println!("{}", buf[..len]);
+//!    })
+//! }
+//! ```
+
 #[macro_use]
 extern crate log;
 
@@ -24,14 +48,6 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use thiserror::Error;
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn it_works() {
-        assert_eq!(2 + 2, 4);
-    }
-}
 
 #[derive(Error, Debug)]
 pub enum Error {
@@ -48,19 +64,12 @@ enum ReadState {
     Busy,
 }
 
-struct DeviceInner {
-    device: Arc<Mutex<HidDevice>>,
-    read_thread: Option<std::thread::JoinHandle<()>>,
+pub struct Device {
+    // store an Option so that `close` can drop the HidDevice.
+    device: Option<HidDevice>,
     rstate: ReadState,
-    data_rx: mpsc::Receiver<Option<[u8; 64]>>, // One message per read
-    req_tx: Option<mpsc::Sender<Waker>>,       // One message per expected read
     buffer: Option<[u8; 64]>,
     buffer_pos: usize,
-}
-
-pub struct Device {
-    // store an Option so that `close` works
-    inner: Option<Arc<Mutex<DeviceInner>>>,
 }
 
 impl Clone for Device {
@@ -71,102 +80,20 @@ impl Clone for Device {
     }
 }
 
-impl Drop for Device {
-    fn drop(&mut self) {
-        debug!("dropping hid connection");
-        if let Some(inner) = self.inner.take() {
-            if let Ok(mut guard) = inner.lock() {
-                // Take the waker queue and drop it so that the reader thread finihes
-                let req_tx = guard.req_tx.take();
-                drop(req_tx);
-
-                // Wait for the reader thread to finish
-                match guard.read_thread.take() {
-                    Some(jh) => match jh.join() {
-                        Ok(_) => info!("device read thread joined"),
-                        Err(_) => error!("failed to join device read thread"),
-                    },
-                    None => error!("already joined"),
-                }
-            } else {
-                error!("Failed to take lock on device");
-            }
-        } else {
-            error!("there was no inner");
+impl Device {
+    pub fn new(device: HidDevice) -> Self {
+        device.set_blocking_mode(false);
+        // Must be accessed from both inner thread and asyn_write
+        Device {
+                Some(device),
+                rstate: ReadState::Idle,
+                buffer: None,
+                buffer_pos: 0,
         }
     }
 }
 
-impl Device {
-    pub fn new(device: HidDevice) -> Result<Self, Error> {
-        let (data_tx, data_rx) = mpsc::channel();
-        let (req_tx, req_rx) = mpsc::channel::<Waker>();
-        // set non-blocking so that we can ignore spurious wakeups.
-        //device.set_blocking_mode(false);
-        // Must be accessed from both inner thread and asyn_write
-        let device = Arc::new(Mutex::new(device));
-        let jh = std::thread::spawn({
-            let device = Arc::clone(&device);
-            move || {
-                loop {
-                    // Wait for read request
-                    debug!("waiting for request");
-                    let waker = match req_rx.recv() {
-                        Ok(waker) => waker,
-                        Err(_e) => {
-                            info!("No more wakers, shutting down");
-                            return;
-                        }
-                    };
-                    debug!("Got notified");
-                    match device.lock() {
-                        Ok(guard) => {
-                            let mut buf = [0u8; 64];
-                            //match guard.read_timeout(&mut buf[..], 1000) {
-                            match guard.read(&mut buf[..]) {
-                                Err(e) => {
-                                    error!("hidapi failed: {}", e);
-                                    drop(data_tx);
-                                    waker.wake_by_ref();
-                                    break;
-                                }
-                                Ok(len) => {
-                                    if len == 0 {
-                                        data_tx.send(None).unwrap();
-                                        waker.wake_by_ref();
-                                        continue;
-                                    }
-                                    debug!("Read data");
-                                    if let Err(e) = data_tx.send(Some(buf)) {
-                                        error!("Sending internally: {}", e);
-                                        break;
-                                    }
-                                    waker.wake_by_ref();
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            error!("Broken lock: {:?}", e);
-                            return;
-                        }
-                    }
-                }
-            }
-        });
-        Ok(Device {
-            inner: Some(Arc::new(Mutex::new(DeviceInner {
-                device,
-                read_thread: Some(jh),
-                rstate: ReadState::Idle,
-                data_rx,
-                req_tx: Some(req_tx),
-                buffer: None,
-                buffer_pos: 0,
-            }))),
-        })
-    }
-}
-
+/// See [HidDevice] for details regarding report id.
 impl AsyncWrite for Device {
     fn poll_write(
         mut self: Pin<&mut Self>,
@@ -181,32 +108,11 @@ impl AsyncWrite for Device {
             )));
         }
         loop {
-            let max_len = usize::min(64, buf.len());
-            // The hidapi API requires that you put the report ID in the first byte.
-            // If you don't use report IDs you must put a 0 there.
-            let mut buf_with_report_id = [0u8; 1 + 64];
-            (&mut buf_with_report_id[1..1 + max_len]).copy_from_slice(&buf[..max_len]);
-
-            //let this: &mut Self = &mut self;
-            debug!("Will write {:?}", &buf_with_report_id[..]);
-            match self.inner.as_mut().unwrap().lock() {
-                Ok(guard) => match guard.device.lock() {
-                    Ok(guard) => {
-                        guard
-                            .write(&buf_with_report_id[..])
-                            .map_err(|_| io::Error::new(io::ErrorKind::Other, "hidapi failed"))?;
-                        debug!("Wrote: {:?}", &buf[0..max_len]);
-                    }
-                    Err(e) => error!("{:?}", e),
-                },
-                Err(e) => {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("Mutex broken: {:?}", e),
-                    )))
-                }
-            }
-            buf = &buf[max_len..];
+            debug!("Will write {:?}", &buf[..]);
+            // TODO: Could this write block, and what to do then?
+            let len = self.inner.as_mut().unwrap().write(&buf[..])
+                .map_err(|_| io::Error::new(io::ErrorKind::Other, "hidapi failed"))?;
+            buf = &buf[len..];
             if buf.len() == 0 {
                 debug!("Wrote total {}: {:?}", buf.len(), buf);
                 return Poll::Ready(Ok(len));
@@ -214,6 +120,7 @@ impl AsyncWrite for Device {
         }
     }
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context) -> Poll<Result<(), io::Error>> {
+        // libhidapi doesn't have a concept of flush
         Poll::Ready(Ok(()))
     }
     // TODO cleanup read thread...
@@ -228,6 +135,7 @@ impl AsyncWrite for Device {
 // Will always read out 64 bytes. Make sure to read out all bytes to avoid trailing bytes in next
 // readout.
 // Will store all bytes that did not fit in provided buffer and give them next time.
+/// See [HidDevice] for details regarding report id.
 impl AsyncRead for Device {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -314,5 +222,49 @@ impl AsyncRead for Device {
                 }
             };
         }
+                loop {
+                    // Wait for read request
+                    debug!("waiting for request");
+                    let waker = match req_rx.recv() {
+                        Ok(waker) => waker,
+                        Err(_e) => {
+                            info!("No more wakers, shutting down");
+                            return;
+                        }
+                    };
+                    debug!("Got notified");
+                    match device.lock() {
+                        Ok(guard) => {
+                            let mut buf = [0u8; 64];
+                            //match guard.read_timeout(&mut buf[..], 1000) {
+                            match guard.read(&mut buf[..]) {
+                                Err(e) => {
+                                    error!("hidapi failed: {}", e);
+                                    drop(data_tx);
+                                    waker.wake_by_ref();
+                                    break;
+                                }
+                                Ok(len) => {
+                                    if len == 0 {
+                                        data_tx.send(None).unwrap();
+                                        waker.wake_by_ref();
+                                        continue;
+                                    }
+                                    debug!("Read data");
+                                    if let Err(e) = data_tx.send(Some(buf)) {
+                                        error!("Sending internally: {}", e);
+                                        break;
+                                    }
+                                    waker.wake_by_ref();
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!("Broken lock: {:?}", e);
+                            return;
+                        }
+                    }
+                }
+            }
     }
 }
