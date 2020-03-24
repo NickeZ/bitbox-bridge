@@ -57,16 +57,27 @@ fn is_valid_origin(host: &str) -> bool {
         || host == "myetherwallet.com"
 }
 
-fn add_origin(
-    reply: impl warp::Reply + 'static,
-    origin: Option<String>,
-) -> Box<dyn warp::Reply + 'static> {
+enum AddOrigin<T> {
+    Unwrapped(T),
+    Wrapped(warp::reply::WithHeader<warp::reply::WithHeader<T>>),
+}
+
+impl<T: warp::Reply> warp::Reply for AddOrigin<T> {
+    fn into_response(self) -> warp::reply::Response {
+        match self {
+            AddOrigin::Unwrapped(reply) => reply.into_response(),
+            AddOrigin::Wrapped(reply) => reply.into_response(),
+        }
+    }
+}
+
+fn add_origin(reply: impl warp::Reply, origin: Option<String>) -> impl warp::Reply {
     match origin {
         Some(origin) => {
             let reply = warp::reply::with_header(reply, "Access-Control-Allow-Origin", origin);
-            Box::new(warp::reply::with_header(reply, "Vary", "Origin"))
+            AddOrigin::Wrapped(warp::reply::with_header(reply, "Vary", "Origin"))
         }
-        None => Box::new(reply),
+        None => AddOrigin::Unwrapped(reply),
     }
 }
 
