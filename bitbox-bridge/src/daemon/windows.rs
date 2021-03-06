@@ -86,7 +86,7 @@ pub async fn start() {
     std::thread::spawn(move || {
         // Blocking call, will block until service is killed by Winows
         if let Err(e) = service_dispatcher::start("bitbox-bridge", ffi_service_main) {
-            error!("Failed to register as started service: {:?}", e);
+            warn!("Failed to register as started service, will run forever. Error: {:}", e);
             tx.send(false).unwrap();
             return;
         }
